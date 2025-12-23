@@ -1,6 +1,6 @@
 # ICMLT-2026-Mamba-LSTM-Coastline-Prediction
 This is a file for opening the coding for ICMLT 2026
-# Coastline Prediction: A Multi-Method Comparison
+## Coastline Prediction: A Multi-Method Comparison
 
 This repository implements and compares five methods for shoreline time series forecasting, supporting the EU Horizon TERRA project's Digital Twin for Monitoring Coastal Change.
 
