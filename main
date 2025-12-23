@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+5-way Coastline Prediction Comparison:
+1. LSTM (baseline)
+2. Diffusion-Ridge
+3. Diffusion-Linear (SGD)
+4. Mamba+LSTM
+5. LSTM-Diffusion (NEW)
+
+With enhanced visualizations:
+- Multi-year prediction comparison
+- Error distribution histograms
+- Temporal MSE curves
+- Radar chart for metrics
+- Heatmap of prediction errors
+"""
+
+import os, re, glob, json
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import Patch
+from scipy.interpolate import splprep, splev
+from scipy.spatial.distance import cdist
+
+import seaborn as sns
+
+
+# =========================================================
+# 0) Utils
+# =========================================================
+def get_device(prefer_cuda=True):
+    if prefer_cuda and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def set_seed(seed: int = 0):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# =========================================================
+# 1) LabelMe JSON -> Coastline extraction (mask-based)
+# =========================================================
+class LabelMeCoastlineLoader:
+    def __init__(self, resample_points: int = 256):
+        self.resample_points = resample_points
+
+    def load_single_json(self, json_path: str) -> Dict:
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            return {"success": False, "error": f"JSON read failed: {e}"}
+
+        all_points = []
+        for shape in data.get("shapes", []):
+            pts = shape.get("points", [])
+            if pts:
+                all_points.extend(pts)
+
+        if not all_points:
+            return {"success": False, "error": "No points found in shapes"}
+
+        coords = np.array(all_points, dtype=np.float32)
+        image_width = int(data.get("imageWidth", 512))
+        image_height = int(data.get("imageHeight", 512))
+        return {
+            "success": True,
+            "raw_coords": coords,
+            "image_size": (image_width, image_height),
+            "image_path": data.get("imagePath", ""),
+            "n_shapes": len(data.get("shapes", [])),
+        }
+
+    def extract_coastline_from_json(self, json_path: str, normalize: bool = True) -> Dict:
+        result = self.load_single_json(json_path)
+        if not result["success"]:
+            return result
+
+        raw_coords = result["raw_coords"]
+        image_size = result["image_size"]
+
+        coastline_coords = self._extract_lower_boundary_mask(raw_coords, image_size, x_step=1, min_run=15)
+        coastline_coords = self._median_smooth_y(coastline_coords, k=9)
+        coastline_coords = self._remove_outliers(coastline_coords, threshold=3.0)
+
+        resampled_coords = self._resample_coords(coastline_coords, self.resample_points)
+        final_coords = self._normalize_coords(resampled_coords, image_size) if normalize else resampled_coords
+
+        return {
+            "success": True,
+            "raw_coords": raw_coords,
+            "coastline_coords": coastline_coords,
+            "resampled_coords": resampled_coords,
+            "final_coords": final_coords,
+            "image_size": image_size,
+            "n_points": len(final_coords),
+        }
+
+    def _extract_lower_boundary_mask(self, polygon_xy: np.ndarray, image_size: Tuple[int, int],
+                                     x_step=1, min_run=15):
+        W, H = image_size
+        if len(polygon_xy) < 3:
+            return polygon_xy
+
+        poly = polygon_xy.copy()
+        poly[:, 0] = np.clip(poly[:, 0], 0, W - 1)
+        poly[:, 1] = np.clip(poly[:, 1], 0, H - 1)
+
+        mask_img = Image.new("L", (W, H), 0)
+        draw = ImageDraw.Draw(mask_img)
+        draw.polygon([(float(x), float(y)) for x, y in poly], outline=1, fill=1)
+        mask = np.array(mask_img, dtype=np.uint8)
+
+        xs = np.arange(0, W, x_step, dtype=np.int32)
+        y_bottom = np.full(xs.shape, -1, dtype=np.int32)
+        for i, x in enumerate(xs):
+            ys = np.where(mask[:, x] > 0)[0]
+            if ys.size > 0:
+                y_bottom[i] = int(ys.max())
+
+        valid = y_bottom >= 0
+        xs = xs[valid]
+        y_bottom = y_bottom[valid]
+        if xs.size < 3:
+            return polygon_xy
+
+        jumps = np.where(np.diff(xs) > x_step)[0]
+        segments = np.split(np.arange(xs.size), jumps + 1)
+        kept = [seg for seg in segments if seg.size >= min_run]
+        keep_idx = np.concatenate(kept) if kept else np.arange(xs.size)
+
+        xs = xs[keep_idx]
+        y_bottom = y_bottom[keep_idx]
+
+        coastline = np.column_stack([xs.astype(np.float32), y_bottom.astype(np.float32)])
+        coastline = coastline[np.argsort(coastline[:, 0])]
+        return coastline
+
+    def _median_smooth_y(self, coords: np.ndarray, k: int = 9) -> np.ndarray:
+        if coords is None or len(coords) < k or k < 3 or (k % 2 == 0):
+            return coords
+        y = coords[:, 1].copy()
+        r = k // 2
+        y2 = y.copy()
+        for i in range(r, len(y) - r):
+            y2[i] = np.median(y[i - r: i + r + 1])
+        out = coords.copy()
+        out[:, 1] = y2
+        return out
+
+    def _remove_outliers(self, coords: np.ndarray, threshold: float = 3.0) -> np.ndarray:
+        if coords is None or len(coords) < 10:
+            return coords
+        diffs = np.diff(coords, axis=0)
+        distances = np.sqrt(np.sum(diffs ** 2, axis=1))
+        median_dist = np.median(distances)
+        mad = np.median(np.abs(distances - median_dist))
+        if mad < 1e-6:
+            return coords
+        thr = median_dist + threshold * mad
+        good = [coords[0]]
+        for i in range(1, len(coords)):
+            if distances[i - 1] < thr:
+                good.append(coords[i])
+        good = np.array(good, dtype=np.float32)
+        return good if len(good) > 3 else coords
+
+    def _resample_coords(self, coords: np.ndarray, n_points: int) -> np.ndarray:
+        if coords is None or len(coords) < 4:
+            return coords
+        try:
+            _, uniq_idx = np.unique(coords, axis=0, return_index=True)
+            uniq = coords[np.sort(uniq_idx)]
+            if len(uniq) < 4:
+                return coords
+            uniq = uniq[np.argsort(uniq[:, 0])]
+            smoothing = max(1.0, len(uniq) * 0.5)
+            tck, _ = splprep([uniq[:, 0], uniq[:, 1]], s=smoothing, per=False)
+            u_new = np.linspace(0, 1, n_points)
+            x_new, y_new = splev(u_new, tck)
+            return np.column_stack([x_new, y_new]).astype(np.float32)
+        except Exception as e:
+            print(f"[WARN] spline resample failed: {e}. fallback linear.")
+            idx = np.linspace(0, len(coords) - 1, n_points).astype(int)
+            return coords[idx]
+
+    def _normalize_coords(self, coords: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
+        W, H = image_size
+        out = coords.copy().astype(np.float32)
+        out[:, 0] = out[:, 0] / float(W)
+        out[:, 1] = 1.0 - (out[:, 1] / float(H))
+        return out
+
+    def load_time_series(self, annotations_dir: str, normalize: bool = True) -> Dict:
+        json_files = glob.glob(os.path.join(annotations_dir, "*.json"))
+        if not json_files:
+            return {"success": False, "error": f"No JSON files found in {annotations_dir}"}
+
+        def parse_ym(name: str):
+            m = re.search(r"(\d{4})[_-]?(\d{2})", name)
+            if not m:
+                return None
+            y = int(m.group(1));
+            mo = int(m.group(2))
+            if mo < 1 or mo > 12:
+                return None
+            return y, mo
+
+        time_data = []
+        for p in json_files:
+            fn = os.path.basename(p)
+            ym = parse_ym(fn)
+            if ym is None:
+                continue
+            y, mo = ym
+            time_data.append({"path": p, "year": y, "month": mo, "timestamp": y * 12 + mo})
+
+        if not time_data:
+            return {"success": False, "error": "No JSON filenames match YYYY_MM pattern"}
+
+        time_data.sort(key=lambda x: x["timestamp"])
+
+        coastlines, timestamps, years, failed = [], [], [], []
+        print(f"Found {len(time_data)} JSON files.")
+        for item in time_data:
+            r = self.extract_coastline_from_json(item["path"], normalize=normalize)
+            if r["success"]:
+                coastlines.append(r["final_coords"])
+                timestamps.append(f"{item['year']}_{item['month']:02d}")
+                years.append(item['year'])
+                print(f" ✓ {timestamps[-1]} ({len(r['final_coords'])} pts)")
+            else:
+                failed.append(item["path"])
+                print(f" ✗ {os.path.basename(item['path'])}: {r.get('error', 'unknown')}")
+
+        return {
+            "success": True,
+            "coastlines": coastlines,
+            "timestamps": timestamps,
+            "years": years,
+            "n_timesteps": len(coastlines),
+            "n_points": self.resample_points,
+            "failed": failed,
+        }
+
+
+# =========================================================
+# 2) Dataset
+# =========================================================
+class TimeSeriesCoastlineDataset(Dataset):
+    def __init__(self, coastlines: List[np.ndarray], history_length: int = 5):
+        self.samples, self.targets = [], []
+        n = len(coastlines)
+        for i in range(n - history_length):
+            hist = np.stack(coastlines[i:i + history_length]).astype(np.float32)
+            tgt = coastlines[i + history_length].astype(np.float32)
+            self.samples.append(hist)
+            self.targets.append(tgt)
+        print(f"Dataset: {len(self.samples)} samples | history_length={history_length}")
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.samples[idx]), torch.from_numpy(self.targets[idx])
+
+
+# =========================================================
+# 3) Metrics
+# =========================================================
+class CoastlineMetrics:
+    @staticmethod
+    def mse(pred, target): return float(np.mean((pred - target) ** 2))
+
+    @staticmethod
+    def rmse(pred, target): return float(np.sqrt(CoastlineMetrics.mse(pred, target)))
+
+    @staticmethod
+    def mae(pred, target): return float(np.mean(np.abs(pred - target)))
+
+    @staticmethod
+    def hausdorff(pred, target):
+        d1 = cdist(pred, target);
+        d2 = cdist(target, pred)
+        return float(max(np.max(np.min(d1, axis=1)), np.max(np.min(d2, axis=1))))
+
+    @staticmethod
+    def max_error(pred, target):
+        return float(np.max(np.sqrt(np.sum((pred - target) ** 2, axis=1))))
+
+    @staticmethod
+    def evaluate_all(pred, target):
+        return {
+            "MSE": CoastlineMetrics.mse(pred, target),
+            "RMSE": CoastlineMetrics.rmse(pred, target),
+            "MAE": CoastlineMetrics.mae(pred, target),
+            "Hausdorff": CoastlineMetrics.hausdorff(pred, target),
+            "MaxError": CoastlineMetrics.max_error(pred, target)
+        }
+
+
+# =========================================================
+# 4) Baseline LSTM
+# =========================================================
+class TemporalCoastlineLSTM(nn.Module):
+    def __init__(self, n_points=256, coord_dim=2, hidden_dim=512, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.input_dim = n_points * coord_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.ReLU()
+        )
+        self.lstm = nn.LSTM(hidden_dim // 2, hidden_dim // 2, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.input_dim)
+        )
+        self.n_points = n_points
+        self.coord_dim = coord_dim
+
+    def forward(self, x):
+        B, T, P, C = x.shape
+        xf = x.view(B, T, -1)
+        z = self.encoder(xf)
+        out, _ = self.lstm(z)
+        last = out[:, -1, :]
+        y = self.decoder(last)
+        return y.view(B, P, C)
+
+
+class CoastlineTrainer:
+    def __init__(self, model: nn.Module, device: torch.device, lr: float = 5e-4):
+        self.device = device
+        self.model = model.to(device)
+        self.opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        self.sched = optim.lr_scheduler.ReduceLROnPlateau(self.opt, mode="min", factor=0.5, patience=10)
+        self.crit = nn.MSELoss()
+        self.train_losses = []
+        self.val_losses = []
+
+    def _run_epoch(self, loader: DataLoader, train=True) -> float:
+        self.model.train(train)
+        total = 0.0
+        for x, y in loader:
+            x = x.to(self.device);
+            y = y.to(self.device)
+            if train: self.opt.zero_grad(set_to_none=True)
+            pred = self.model(x)
+            loss = self.crit(pred, y)
+            if train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.opt.step()
+            total += float(loss.item())
+        return total / max(1, len(loader))
+
+    def fit(self, train_loader, val_loader, epochs=60, early_patience=15, save_path=None, tag="MODEL"):
+        best = float("inf");
+        bad = 0
+        for ep in range(1, epochs + 1):
+            tr = self._run_epoch(train_loader, True)
+            va = self._run_epoch(val_loader, False)
+            self.train_losses.append(tr)
+            self.val_losses.append(va)
+            self.sched.step(va)
+            print(f"[{tag}] Epoch {ep:03d}/{epochs} | Train {tr:.6f} | Val {va:.6f}")
+            if va < best:
+                best = va;
+                bad = 0
+                if save_path:
+                    torch.save(self.model.state_dict(), save_path)
+            else:
+                bad += 1
+                if bad >= early_patience:
+                    print(f"[{tag}] Early stop. Best Val={best:.6f}")
+                    break
+        return self.train_losses, self.val_losses
+
+
+class CoastlinePredictor:
+    def __init__(self, model: nn.Module, device: torch.device):
+        self.device = device
+        self.model = model.to(device).eval()
+
+    @torch.no_grad()
+    def predict_next(self, history_xy: np.ndarray) -> np.ndarray:
+        x = torch.from_numpy(history_xy.astype(np.float32)).unsqueeze(0).to(self.device)
+        return self.model(x)[0].cpu().numpy()
+
+
+# =========================================================
+# 5) Diffusion baselines (Ridge + Linear SGD)
+# =========================================================
+def diffusion_precompute(T: int, device: torch.device):
+    betas = torch.linspace(1e-4, 2e-2, T, device=device, dtype=torch.float32)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return betas, alphas, alpha_bars
+
+
+def make_xy_windows(coastlines_xy: List[np.ndarray], history_length: int):
+    N = len(coastlines_xy)
+    P = coastlines_xy[0].shape[0]
+    H = P * 2
+    M = N - history_length
+
+    past_seq = np.zeros((M, history_length, H), dtype=np.float32)
+    past_flat = np.zeros((M, history_length * H), dtype=np.float32)
+    future = np.zeros((M, H), dtype=np.float32)
+
+    for w in range(M):
+        hist = np.stack(coastlines_xy[w:w + history_length], axis=0).astype(np.float32)
+        histH = hist.reshape(history_length, H)
+        past_seq[w] = histH
+        past_flat[w] = histH.reshape(-1)
+        future[w] = coastlines_xy[w + history_length].astype(np.float32).reshape(-1)
+
+    return past_seq, past_flat, future
+
+
+class ZScoreTorch:
+    def __init__(self, eps=1e-6):
+        self.eps = eps
+        self.mean = None
+        self.std = None
+
+    def fit(self, X: torch.Tensor):
+        self.mean = X.mean(dim=0, keepdim=True)
+        self.std = X.std(dim=0, keepdim=True) + self.eps
+        return self
+
+    def transform(self, X: torch.Tensor) -> torch.Tensor:
+        return (X - self.mean) / self.std
+
+    def inverse(self, X: torch.Tensor) -> torch.Tensor:
+        return X * self.std + self.mean
+
+
+def train_diffusion_ridge_streaming(past_flat_s: torch.Tensor, future_s: torch.Tensor,
+                                    T: int, n_train_samples: int, chunk_size: int,
+                                    ridge: float, device: torch.device, seed: int = 0):
+    set_seed(seed)
+    M, L = past_flat_s.shape
+    H = future_s.shape[1]
+    betas, alphas, alpha_bars = diffusion_precompute(T, device=device)
+    d = H + L + 2  # +t +bias
+
+    XtX = torch.zeros((d, d), device=device, dtype=torch.float64)
+    XtY = torch.zeros((d, H), device=device, dtype=torch.float64)
+
+    gen = torch.Generator(device=device);
+    gen.manual_seed(seed + 777)
+    remaining = n_train_samples;
+    processed = 0
+    while remaining > 0:
+        bs = min(chunk_size, remaining)
+        idx = torch.randint(0, M, (bs,), generator=gen, device=device)
+        past = past_flat_s[idx]
+        x0 = future_s[idx]
+        t = torch.randint(0, T, (bs,), generator=gen, device=device)
+        ab = alpha_bars[t].unsqueeze(1)
+        eps = torch.randn((bs, H), generator=gen, device=device)
+        x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * eps
+
+        t_norm = (t.float() / float(T - 1)).unsqueeze(1)
+        ones = torch.ones((bs, 1), device=device)
+        phi = torch.cat([x_t, past, t_norm, ones], dim=1)
+
+        phi64 = phi.to(torch.float64);
+        eps64 = eps.to(torch.float64)
+        XtX += phi64.T @ phi64
+        XtY += phi64.T @ eps64
+
+        processed += bs;
+        remaining -= bs
+        if processed % max(1, n_train_samples // 5) == 0:
+            print(f"[Diff-Ridge] accumulated {processed}/{n_train_samples}")
+
+    I = torch.eye(d, device=device, dtype=torch.float64)
+    W = torch.linalg.solve(XtX + ridge * I, XtY).to(torch.float32)
+    return {"W": W, "betas": betas, "alphas": alphas, "alpha_bars": alpha_bars, "T": T, "H": H}
+
+
+@torch.no_grad()
+def diffusion_ridge_sample_batch(model: Dict, past_flat_s: torch.Tensor, n_samples: int = 4, seed: int = 0):
+    W = model["W"];
+    betas = model["betas"];
+    alphas = model["alphas"];
+    alpha_bars = model["alpha_bars"]
+    T = model["T"];
+    H = model["H"]
+    device = past_flat_s.device
+    B, L = past_flat_s.shape
+    S = max(1, int(n_samples))
+
+    gen = torch.Generator(device=device);
+    gen.manual_seed(seed)
+    past_rep = past_flat_s.repeat_interleave(S, dim=0)
+    x = torch.randn((S * B, H), generator=gen, device=device)
+
+    for t in range(T - 1, -1, -1):
+        beta = betas[t];
+        alpha = alphas[t];
+        a_bar = alpha_bars[t]
+        t_norm = torch.full((S * B, 1), float(t) / float(T - 1), device=device)
+        ones = torch.ones((S * B, 1), device=device)
+        phi = torch.cat([x, past_rep, t_norm, ones], dim=1)
+        eps_hat = phi @ W
+        denom = torch.sqrt(1.0 - a_bar + 1e-8)
+        mean = (1.0 / torch.sqrt(alpha)) * (x - (beta / denom) * eps_hat)
+        if t > 0:
+            z = torch.randn((S * B, H), generator=gen, device=device)
+            x = mean + torch.sqrt(beta) * z
+        else:
+            x = mean
+    return x.view(S, B, H).mean(dim=0)
+
+
+class LinearEpsPredictor(nn.Module):
+    def __init__(self, H: int, L: int):
+        super().__init__()
+        self.H = H
+        self.fc = nn.Linear(H + L + 1, H)
+
+    def forward(self, x_t, past_flat, t_norm):
+        phi = torch.cat([x_t, past_flat, t_norm], dim=1)
+        return self.fc(phi)
+
+
+def train_diffusion_sgd_linear(past_flat_s: torch.Tensor, future_s: torch.Tensor,
+                               T: int, steps: int, batch_size: int, lr: float,
+                               device: torch.device, seed: int = 0, grad_clip: float = 5.0):
+    set_seed(seed)
+    M, L = past_flat_s.shape
+    H = future_s.shape[1]
+    _, _, alpha_bars = diffusion_precompute(T, device=device)
+    model = LinearEpsPredictor(H=H, L=L).to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
+    gen = torch.Generator(device=device);
+    gen.manual_seed(seed + 123)
+
+    for it in range(1, steps + 1):
+        idx = torch.randint(0, M, (batch_size,), generator=gen, device=device)
+        past = past_flat_s[idx]
+        x0 = future_s[idx]
+        t = torch.randint(0, T, (batch_size,), generator=gen, device=device)
+        ab = alpha_bars[t].unsqueeze(1)
+        eps = torch.randn((batch_size, H), generator=gen, device=device)
+        x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * eps
+        t_norm = (t.float() / float(T - 1)).unsqueeze(1)
+        eps_hat = model(x_t, past, t_norm)
+        loss = torch.mean((eps - eps_hat) ** 2)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        opt.step()
+
+        if it % max(1, steps // 6) == 0:
+            print(f"[Diff-Linear(SGD)] step {it}/{steps} loss={float(loss.item()):.6f}")
+    model.eval()
+    return model, alpha_bars
+
+
+@torch.no_grad()
+def diffusion_sample_batch_linear(model: LinearEpsPredictor, past_flat_s: torch.Tensor,
+                                  T: int, alpha_bars: torch.Tensor, n_samples: int = 8, seed: int = 0):
+    device = past_flat_s.device
+    B, L = past_flat_s.shape
+    H = model.H
+    S = max(1, int(n_samples))
+    gen = torch.Generator(device=device);
+    gen.manual_seed(seed)
+    past_rep = past_flat_s.repeat_interleave(S, dim=0)
+    x_t = torch.randn((S * B, H), generator=gen, device=device)
+    for t in range(T - 1, -1, -1):
+        ab = alpha_bars[t]
+        t_norm = torch.full((S * B, 1), float(t) / float(T - 1), device=device)
+        eps_hat = model(x_t, past_rep, t_norm)
+        x0_hat = (x_t - torch.sqrt(1.0 - ab) * eps_hat) / torch.sqrt(ab)
+        if t > 0:
+            ab_prev = alpha_bars[t - 1]
+            z = torch.randn((S * B, H), generator=gen, device=device)
+            x_t = torch.sqrt(ab_prev) * x0_hat + torch.sqrt(1.0 - ab_prev) * z
+        else:
+            x_t = x0_hat
+    return x_t.view(S, B, H).mean(dim=0)
+
+
+# =========================================================
+# 6) Mamba + LSTM (improved)
+# =========================================================
+def _try_build_mamba(d_model: int):
+    try:
+        from mamba_ssm import Mamba
+        return Mamba(d_model=d_model)
+    except Exception:
+        return None
+
+
+class MambaLiteBlock(nn.Module):
+    """
+    Mamba-like mixer: depthwise conv over time + gated MLP + residual.
+    Improved with LayerNorm and better gating.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, kernel_size: int = 3):
+        super().__init__()
+        self.ln = nn.LayerNorm(d_model)
+        self.dwconv = nn.Conv1d(
+            d_model, d_model,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=d_model
+        )
+        self.pw1 = nn.Linear(d_model, 8 * d_model)
+        self.pw2 = nn.Linear(4 * d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.ln(x)
+        h2 = self.dwconv(h.transpose(1, 2)).transpose(1, 2)
+        u = self.pw1(h2)
+        a, b = u.chunk(2, dim=-1)
+        h3 = torch.tanh(a) * torch.sigmoid(b)  # gated activation
+        h3 = self.pw2(h3)
+        return x + self.drop(h3)
+
+
+class MambaLSTMForecaster(nn.Module):
+    def __init__(self, H: int, history_len: int, d_model: int = 256,
+                 mamba_layers: int = 2, lstm_hidden: int = 256, lstm_layers: int = 1,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.H = H
+        self.history_len = history_len
+        self.in_proj = nn.Linear(H, d_model)
+
+        # Positional encoding for temporal awareness
+        self.pos_enc = nn.Parameter(torch.randn(1, history_len, d_model) * 0.02)
+
+        real_mamba = _try_build_mamba(d_model)
+        if real_mamba is not None:
+            print("[Mamba+LSTM] Using mamba_ssm.Mamba (installed).")
+            self.mamba_stack = nn.ModuleList([_try_build_mamba(d_model) for _ in range(mamba_layers)])
+        else:
+            print("[Mamba+LSTM] mamba-ssm not found -> using MambaLite blocks.")
+            self.mamba_stack = nn.ModuleList([MambaLiteBlock(d_model, dropout=dropout) for _ in range(mamba_layers)])
+
+        self.lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0
+        )
+
+        self.out = nn.Sequential(
+            nn.Linear(lstm_hidden, lstm_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden, H)
+        )
+
+    def forward(self, x):
+        B, T, P, C = x.shape
+        xf = x.reshape(B, T, -1)
+        z = self.in_proj(xf) + self.pos_enc[:, :T, :]
+        for blk in self.mamba_stack:
+            z = blk(z)
+        out, _ = self.lstm(z)
+        last = out[:, -1, :]
+        y = self.out(last)
+        return y.view(B, P, C)
+
+
+# =========================================================
+# 7) IMPROVED: Mamba-Diffusion with Cross-Attention & CFG
+# =========================================================
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal positional embedding for diffusion timestep"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb = np.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        return emb
+
+
+class CrossAttentionBlock(nn.Module):
+    """Cross-attention for conditioning"""
+
+    def __init__(self, query_dim: int, context_dim: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = query_dim // n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.to_q = nn.Linear(query_dim, query_dim)
+        self.to_k = nn.Linear(context_dim, query_dim)
+        self.to_v = nn.Linear(context_dim, query_dim)
+        self.to_out = nn.Sequential(
+            nn.Linear(query_dim, query_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(query_dim)
+        self.norm2 = nn.LayerNorm(context_dim)
+
+    def forward(self, x, context):
+        # x: (B, D), context: (B, T, C)
+        B = x.shape[0]
+        x_norm = self.norm1(x)
+        context_norm = self.norm2(context)
+
+        x_q = x_norm.unsqueeze(1)
+
+        q = self.to_q(x_q)
+        k = self.to_k(context_norm)
+        v = self.to_v(context_norm)
+
+        q = q.view(B, 1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, 1, -1)
+        out = self.to_out(out).squeeze(1)
+
+        return x + out
+
+
+class ResidualMLPBlock(nn.Module):
+    """Residual MLP block with time embedding"""
+
+    def __init__(self, dim: int, time_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim)
+        )
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, t_emb):
+        h = self.norm(x)
+        h = self.mlp(h)
+        h = h + self.time_mlp(t_emb)
+        return x + self.dropout(h)
+
+
+class ImprovedDenoiser(nn.Module):
+    """
+    Improved denoiser with:
+    - Sinusoidal time embedding
+    - Cross-attention for conditioning
+    - Residual MLP blocks
+    """
+
+    def __init__(self, H: int, cond_seq_dim: int, cond_seq_len: int,
+                 hidden_dim: int = 512, time_dim: int = 256,
+                 n_blocks: int = 6, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.H = H
+        self.hidden_dim = hidden_dim
+
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(time_dim),
+            nn.Linear(time_dim, time_dim * 2),
+            nn.GELU(),
+            nn.Linear(time_dim * 2, time_dim)
+        )
+
+        self.input_proj = nn.Linear(H, hidden_dim)
+        self.cond_proj = nn.Linear(cond_seq_dim, hidden_dim)
+
+        self.blocks = nn.ModuleList()
+        for i in range(n_blocks):
+            self.blocks.append(nn.ModuleDict({
+                'res_block': ResidualMLPBlock(hidden_dim, time_dim, dropout),
+                'cross_attn': CrossAttentionBlock(hidden_dim, hidden_dim, n_heads, dropout)
+            }))
+
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, H)
+        )
+
+    def forward(self, x_t, cond_seq, t):
+        t_emb = self.time_embed(t.float())
+        h = self.input_proj(x_t)
+        cond = self.cond_proj(cond_seq)
+
+        for block in self.blocks:
+            h = block['res_block'](h, t_emb)
+            h = block['cross_attn'](h, cond)
+
+        return self.output_proj(h)
+
+
+class MambaEncoderBlock(nn.Module):
+    """
+    Enhanced Mamba-like block for sequence encoding.
+    Uses depthwise conv + gated MLP + residual.
+    """
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4,
+                 expand: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = d_model * expand
+
+        self.ln = nn.LayerNorm(d_model)
+
+        # Input projection
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
+
+        # Depthwise conv for local context
+        self.conv1d = nn.Conv1d(
+            self.d_inner, self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner
+        )
+
+        # SSM-like parameters (simplified)
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2)
+        self.dt_proj = nn.Linear(d_state, self.d_inner)
+
+        # Output projection
+        self.out_proj = nn.Linear(self.d_inner, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # Learnable parameters for SSM
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, d_state) * 0.1)
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        # SiLU activation (compatible with older PyTorch)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        # x: (B, T, D)
+        B, T, D = x.shape
+        residual = x
+        x = self.ln(x)
+
+        # Input projection and split
+        xz = self.in_proj(x)  # (B, T, 2*d_inner)
+        x_main, z = xz.chunk(2, dim=-1)  # each (B, T, d_inner)
+
+        # Depthwise conv
+        x_conv = self.conv1d(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        x_conv = self.silu(x_conv)
+
+        # Simplified SSM computation
+        x_ssm = self.x_proj(x_conv)  # (B, T, d_state*2)
+        B_param, C_param = x_ssm.chunk(2, dim=-1)  # each (B, T, d_state)
+
+        # Discretized state space
+        A = -torch.exp(self.A_log)  # (d_inner, d_state)
+        dt = F.softplus(self.dt_proj(B_param))  # (B, T, d_inner)
+
+        # Compute output through selective scan approximation
+        # Simplified: use exponential moving average style update
+        dA = torch.exp(dt.unsqueeze(-1) * A)  # (B, T, d_inner, d_state)
+        dB = dt.unsqueeze(-1) * B_param.unsqueeze(2)  # (B, T, d_inner, d_state)
+
+        # Scan (simplified with cumsum approximation)
+        h = torch.zeros(B, self.d_inner, A.shape[1], device=x.device)
+        ys = []
+        for t_idx in range(T):
+            h = dA[:, t_idx] * h + dB[:, t_idx] * x_conv[:, t_idx:t_idx + 1].transpose(1, 2)
+            y_t = (h * C_param[:, t_idx].unsqueeze(1)).sum(-1)  # (B, d_inner)
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)  # (B, T, d_inner)
+
+        # Add skip connection with D
+        y = y + x_conv * self.D
+
+        # Gating
+        y = y * self.silu(z)
+
+        # Output projection
+        out = self.out_proj(y)
+        out = self.dropout(out)
+
+        return residual + out
+
+
+class MambaConditionEncoder(nn.Module):
+    """
+    Mamba-based encoder for history sequence encoding.
+    Better at capturing long-range dependencies than LSTM.
+    """
+
+    def __init__(self, input_dim: int, d_model: int = 256, n_layers: int = 4,
+                 d_state: int = 16, d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
+        super().__init__()
+
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.out_dim = d_model
+
+        # Stack of Mamba blocks
+        self.blocks = nn.ModuleList([
+            MambaEncoderBlock(d_model, d_state, d_conv, expand, dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.final_ln = nn.LayerNorm(d_model)
+
+        # Attention pooling for global context
+        self.attention = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+    def forward(self, x):
+        # x: (B, T, input_dim)
+        x = self.input_proj(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.final_ln(x)
+
+        # Attention pooling
+        attn_weights = self.attention(x)
+        attn_weights = torch.softmax(attn_weights, dim=1)
+        global_ctx = torch.sum(x * attn_weights, dim=1)
+
+        return x, global_ctx  # sequence and global
+
+
+class MambaDiffusion(nn.Module):
+    """
+    Mamba-Diffusion: Uses Mamba to encode temporal history,
+    then uses conditional diffusion with cross-attention to generate predictions.
+
+    Improvements over LSTM-Diffusion:
+    1. Mamba encoder better captures long-range dependencies
+    2. Cross-attention conditioning (not just concatenation)
+    3. Deeper denoiser with residual connections
+    4. Cosine noise schedule
+    5. Classifier-Free Guidance support
+    6. DDIM fast sampling
+    """
+
+    def __init__(self, H: int, history_len: int,
+                 mamba_dim: int = 256, mamba_layers: int = 4,
+                 mamba_d_state: int = 16, mamba_d_conv: int = 4,
+                 denoiser_hidden: int = 512, denoiser_blocks: int = 6,
+                 time_dim: int = 256, n_heads: int = 4,
+                 T: int = 100, dropout: float = 0.1,
+                 cfg_dropout: float = 0.1):
+        super().__init__()
+        self.H = H
+        self.T = T
+        self.history_len = history_len
+        self.cfg_dropout = cfg_dropout
+
+        # Mamba encoder
+        self.cond_encoder = MambaConditionEncoder(
+            input_dim=H,
+            d_model=mamba_dim,
+            n_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=2,
+            dropout=dropout
+        )
+
+        # Improved denoiser with cross-attention
+        self.denoiser = ImprovedDenoiser(
+            H=H,
+            cond_seq_dim=self.cond_encoder.out_dim,
+            cond_seq_len=history_len,
+            hidden_dim=denoiser_hidden,
+            time_dim=time_dim,
+            n_blocks=denoiser_blocks,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
+        # Learnable null condition for CFG
+        self.null_cond = nn.Parameter(torch.randn(1, history_len, self.cond_encoder.out_dim) * 0.01)
+
+        # Cosine noise schedule
+        self._setup_cosine_schedule(T)
+
+    def _setup_cosine_schedule(self, T: int, s: float = 0.008):
+        """Cosine noise schedule from 'Improved DDPM' paper"""
+        steps = torch.arange(T + 1, dtype=torch.float32)
+        f_t = torch.cos((steps / T + s) / (1 + s) * np.pi / 2) ** 2
+        alpha_bars = f_t / f_t[0]
+        alpha_bars = torch.clamp(alpha_bars, min=1e-5, max=1.0 - 1e-5)
+
+        betas = 1 - alpha_bars[1:] / alpha_bars[:-1]
+        betas = torch.clamp(betas, min=1e-5, max=0.999)
+
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alpha_bars', alpha_bars)
+        self.register_buffer('sqrt_alpha_bars', torch.sqrt(alpha_bars))
+        self.register_buffer('sqrt_one_minus_alpha_bars', torch.sqrt(1.0 - alpha_bars))
+
+    def forward(self, x, return_loss=True):
+        B, T_hist, P, C = x.shape
+        H = P * C
+        x_flat = x.reshape(B, T_hist, H)
+        cond_seq, cond_global = self.cond_encoder(x_flat)
+        return cond_seq, cond_global
+
+    def compute_loss(self, past_seq: torch.Tensor, target: torch.Tensor):
+        """Compute diffusion training loss with CFG dropout."""
+        B = past_seq.shape[0]
+        device = past_seq.device
+
+        cond_seq, _ = self.cond_encoder(past_seq)
+
+        # CFG: randomly drop condition
+        if self.training and self.cfg_dropout > 0:
+            mask = torch.rand(B, 1, 1, device=device) > self.cfg_dropout
+            null_cond = self.null_cond.expand(B, -1, -1)
+            cond_seq = torch.where(mask, cond_seq, null_cond)
+
+        t = torch.randint(0, self.T, (B,), device=device)
+
+        sqrt_alpha_bar = self.sqrt_alpha_bars[t].unsqueeze(1)
+        sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bars[t].unsqueeze(1)
+
+        eps = torch.randn_like(target)
+        x_t = sqrt_alpha_bar * target + sqrt_one_minus_alpha_bar * eps
+
+        eps_pred = self.denoiser(x_t, cond_seq, t)
+
+        loss = torch.mean((eps - eps_pred) ** 2)
+        return loss
+
+    @torch.no_grad()
+    def sample(self, past_seq: torch.Tensor, n_samples: int = 1,
+               cfg_scale: float = 2.0, seed: int = 0):
+        """DDPM sampling with Classifier-Free Guidance."""
+        B = past_seq.shape[0]
+        device = past_seq.device
+
+        cond_seq, _ = self.cond_encoder(past_seq)
+
+        if n_samples > 1:
+            cond_seq = cond_seq.repeat_interleave(n_samples, dim=0)
+            B_eff = B * n_samples
+        else:
+            B_eff = B
+
+        null_cond = self.null_cond.expand(B_eff, -1, -1)
+
+        torch.manual_seed(seed)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed)
+
+        x_t = torch.randn((B_eff, self.H), device=device)
+
+        for t in range(self.T - 1, -1, -1):
+            t_batch = torch.full((B_eff,), t, device=device, dtype=torch.long)
+
+            eps_cond = self.denoiser(x_t, cond_seq, t_batch)
+
+            if cfg_scale != 1.0:
+                eps_uncond = self.denoiser(x_t, null_cond, t_batch)
+                eps_pred = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+            else:
+                eps_pred = eps_cond
+
+            alpha = self.alphas[t]
+            alpha_bar = self.alpha_bars[t]
+            beta = self.betas[t]
+
+            coef1 = 1.0 / torch.sqrt(alpha)
+            coef2 = beta / torch.sqrt(1.0 - alpha_bar)
+            mean = coef1 * (x_t - coef2 * eps_pred)
+
+            if t > 0:
+                sigma = torch.sqrt(beta)
+                z = torch.randn(x_t.shape, device=device)
+                x_t = mean + sigma * z
+            else:
+                x_t = mean
+
+        if n_samples > 1:
+            x_t = x_t.view(n_samples, B, self.H).mean(dim=0)
+
+        return x_t
+
+    @torch.no_grad()
+    def sample_ddim(self, past_seq: torch.Tensor, n_samples: int = 1,
+                    cfg_scale: float = 2.0, steps: int = 20, seed: int = 0):
+        """DDIM sampling (faster, deterministic option)."""
+        B = past_seq.shape[0]
+        device = past_seq.device
+
+        cond_seq, _ = self.cond_encoder(past_seq)
+
+        if n_samples > 1:
+            cond_seq = cond_seq.repeat_interleave(n_samples, dim=0)
+            B_eff = B * n_samples
+        else:
+            B_eff = B
+
+        null_cond = self.null_cond.expand(B_eff, -1, -1)
+
+        torch.manual_seed(seed)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed)
+
+        timesteps = torch.linspace(self.T - 1, 0, steps, dtype=torch.long, device=device)
+
+        x_t = torch.randn((B_eff, self.H), device=device)
+
+        for i, t in enumerate(timesteps):
+            t_batch = torch.full((B_eff,), t.item(), device=device, dtype=torch.long)
+
+            eps_cond = self.denoiser(x_t, cond_seq, t_batch)
+            if cfg_scale != 1.0:
+                eps_uncond = self.denoiser(x_t, null_cond, t_batch)
+                eps_pred = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+            else:
+                eps_pred = eps_cond
+
+            alpha_bar_t = self.alpha_bars[t.long()]
+
+            x0_pred = (x_t - torch.sqrt(1 - alpha_bar_t) * eps_pred) / torch.sqrt(alpha_bar_t)
+            x0_pred = torch.clamp(x0_pred, -3, 3)
+
+            if i < len(timesteps) - 1:
+                t_next = timesteps[i + 1]
+                alpha_bar_t_next = self.alpha_bars[t_next.long()]
+
+                x_t = torch.sqrt(alpha_bar_t_next) * x0_pred + \
+                      torch.sqrt(1 - alpha_bar_t_next) * eps_pred
+            else:
+                x_t = x0_pred
+
+        if n_samples > 1:
+            x_t = x_t.view(n_samples, B, self.H).mean(dim=0)
+
+        return x_t
+
+
+class MambaDiffusionTrainer:
+    """Trainer for Mamba-Diffusion model with EMA"""
+
+    def __init__(self, model: MambaDiffusion, device: torch.device, lr: float = 2e-4):
+        self.device = device
+        self.model = model.to(device)
+        self.opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        self.sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.opt, T_0=20, T_mult=2)
+        self.ema_model = None
+        self.ema_decay = 0.999
+
+    def _update_ema(self):
+        if self.ema_model is None:
+            self.ema_model = {k: v.clone() for k, v in self.model.state_dict().items()}
+        else:
+            for k, v in self.model.state_dict().items():
+                self.ema_model[k] = self.ema_decay * self.ema_model[k] + (1 - self.ema_decay) * v
+
+    def fit(self, past_seq_train: torch.Tensor, future_train: torch.Tensor,
+            past_seq_val: torch.Tensor, future_val: torch.Tensor,
+            epochs: int = 150, batch_size: int = 32, early_patience: int = 25,
+            save_path: str = None):
+
+        M_train = past_seq_train.shape[0]
+        M_val = past_seq_val.shape[0]
+
+        best_val = float('inf')
+        bad_epochs = 0
+
+        for ep in range(1, epochs + 1):
+            self.model.train()
+            perm = torch.randperm(M_train, device=self.device)
+            train_losses = []
+
+            for i in range(0, M_train, batch_size):
+                idx = perm[i:i + batch_size]
+                past = past_seq_train[idx]
+                future = future_train[idx]
+
+                self.opt.zero_grad()
+                loss = self.model.compute_loss(past, future)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.opt.step()
+
+                self._update_ema()
+                train_losses.append(loss.item())
+
+            self.sched.step()
+
+            self.model.eval()
+            with torch.no_grad():
+                val_losses = []
+                for i in range(0, M_val, batch_size):
+                    past = past_seq_val[i:i + batch_size]
+                    future = future_val[i:i + batch_size]
+                    loss = self.model.compute_loss(past, future)
+                    val_losses.append(loss.item())
+
+            train_loss = np.mean(train_losses)
+            val_loss = np.mean(val_losses)
+
+            if ep % 5 == 0 or ep <= 10:
+                print(f"[Mamba-Diff] Epoch {ep:03d}/{epochs} | Train {train_loss:.6f} | Val {val_loss:.6f}")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                bad_epochs = 0
+                if save_path:
+                    if self.ema_model is not None:
+                        torch.save(self.ema_model, save_path)
+                    else:
+                        torch.save(self.model.state_dict(), save_path)
+            else:
+                bad_epochs += 1
+                if bad_epochs >= early_patience:
+                    print(f"[Mamba-Diff] Early stop at epoch {ep}. Best Val={best_val:.6f}")
+                    break
+
+        return best_val
+
+
+# =========================================================
+# 8) Enhanced Visualization Functions
+# =========================================================
+
+# Global color scheme for all methods
+METHOD_COLORS = {
+    'GT': '#000000',
+    'LSTM': '#1f77b4',
+    'Diff-Ridge': '#ff7f0e',
+    'Diff-Linear': '#2ca02c',
+    'Mamba+LSTM': '#d62728',
+    'Mamba-Diffusion': '#9467bd',
+    'LSTM-Diffusion': '#9467bd'  # alias for backward compat
+}
+
+METHOD_ORDER = ['LSTM', 'Diff-Ridge', 'Diff-Linear', 'Mamba+LSTM', 'Mamba-Diffusion']
+
+
+def plot_prediction_compare_5(gt_xy, lstm_xy, diff_ridge_xy, diff_lin_xy, mamba_lstm_xy, mamba_diff_xy,
+                              save_path=None, title="", figsize=(12, 7)):
+    """5-way comparison plot"""
+    plt.figure(figsize=figsize)
+
+    plt.plot(gt_xy[:, 0], gt_xy[:, 1], 'k-', linewidth=2.5, label="Ground Truth", alpha=0.9)
+    plt.plot(lstm_xy[:, 0], lstm_xy[:, 1], '--', linewidth=2, label="LSTM", alpha=0.85, color=METHOD_COLORS['LSTM'])
+    plt.plot(diff_ridge_xy[:, 0], diff_ridge_xy[:, 1], '-.', linewidth=2, label="Diff-Ridge", alpha=0.85,
+             color=METHOD_COLORS['Diff-Ridge'])
+    plt.plot(diff_lin_xy[:, 0], diff_lin_xy[:, 1], ':', linewidth=2, label="Diff-Linear", alpha=0.85,
+             color=METHOD_COLORS['Diff-Linear'])
+    plt.plot(mamba_lstm_xy[:, 0], mamba_lstm_xy[:, 1], '-', linewidth=2, label="Mamba+LSTM", alpha=0.85,
+             color=METHOD_COLORS['Mamba+LSTM'])
+    plt.plot(mamba_diff_xy[:, 0], mamba_diff_xy[:, 1], '-', linewidth=2, label="Mamba-Diffusion", alpha=0.85,
+             color=METHOD_COLORS['Mamba-Diffusion'])
+
+    plt.title(title, fontweight="bold", fontsize=12)
+    plt.xlabel("Normalized X", fontsize=11)
+    plt.ylabel("Normalized Y", fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.gca().set_aspect("equal", adjustable="box")
+    plt.legend(loc='best', fontsize=10)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_multi_year_comparison(predictions_dict: Dict, timestamps: List[str], indices: List[int],
+                               save_path: str = None, figsize=(16, 5)):
+    """Plot predictions for multiple time points (e.g., different years)"""
+    n_plots = len(indices)
+    fig, axes = plt.subplots(1, n_plots, figsize=figsize)
+
+    if n_plots == 1:
+        axes = [axes]
+
+    for ax, idx in zip(axes, indices):
+        for method, preds in predictions_dict.items():
+            color = METHOD_COLORS.get(method, '#888888')
+            if method == 'GT':
+                ax.plot(preds[idx][:, 0], preds[idx][:, 1],
+                        'k-', linewidth=2.5, label=method, alpha=0.9)
+            else:
+                ax.plot(preds[idx][:, 0], preds[idx][:, 1],
+                        linewidth=1.8, label=method, alpha=0.8, color=color)
+
+        ax.set_title(f"Prediction: {timestamps[idx]}", fontweight='bold', fontsize=11)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal', adjustable='box')
+
+    axes[-1].legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_error_distribution(errors_dict: Dict, save_path: str = None, figsize=(14, 5)):
+    """Plot error distribution histograms for each method"""
+    methods = list(errors_dict.keys())
+    n_methods = len(methods)
+
+    fig, axes = plt.subplots(1, n_methods, figsize=figsize)
+    if n_methods == 1:
+        axes = [axes]
+
+    for ax, method in zip(axes, methods):
+        color = METHOD_COLORS.get(method, '#888888')
+        errors = errors_dict[method]
+        ax.hist(errors, bins=30, color=color, alpha=0.7, edgecolor='black', linewidth=0.5)
+        ax.axvline(np.mean(errors), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(errors):.4f}')
+        ax.axvline(np.median(errors), color='green', linestyle=':', linewidth=2,
+                   label=f'Median: {np.median(errors):.4f}')
+        ax.set_title(f"{method}", fontweight='bold', fontsize=11)
+        ax.set_xlabel("MSE")
+        ax.set_ylabel("Frequency")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Error Distribution by Method", fontweight='bold', fontsize=13, y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_temporal_mse_curve(mse_over_time: Dict, timestamps: List[str],
+                            save_path: str = None, figsize=(14, 6)):
+    """Plot MSE over time for each method"""
+    plt.figure(figsize=figsize)
+
+    markers = ['o', 's', '^', 'D', 'v']
+
+    x = np.arange(len(timestamps))
+
+    for i, (method, mses) in enumerate(mse_over_time.items()):
+        color = METHOD_COLORS.get(method, '#888888')
+        plt.plot(x, mses, marker=markers[i % len(markers)],
+                 label=f"{method} (avg: {np.mean(mses):.4f})",
+                 color=color,
+                 linewidth=1.5, markersize=4, alpha=0.8)
+
+    # X-axis formatting - show every nth label
+    n_show = max(1, len(timestamps) // 10)
+    plt.xticks(x[::n_show], timestamps[::n_show], rotation=45, ha='right', fontsize=9)
+
+    plt.xlabel("Time", fontsize=11)
+    plt.ylabel("MSE", fontsize=11)
+    plt.title("Prediction Error Over Time", fontweight='bold', fontsize=13)
+    plt.legend(loc='best', fontsize=9)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_metrics_radar(metrics_dict: Dict, save_path: str = None, figsize=(10, 8)):
+    """Radar chart comparing all metrics across methods"""
+    methods = list(metrics_dict.keys())
+
+    # Get metric names from first method
+    metric_names = list(metrics_dict[methods[0]].keys())
+    n_metrics = len(metric_names)
+
+    # Normalize metrics for radar chart (lower is better, so invert)
+    max_vals = {}
+    for metric in metric_names:
+        max_vals[metric] = max(metrics_dict[m][metric] for m in methods)
+
+    # Create angles for radar chart
+    angles = np.linspace(0, 2 * np.pi, n_metrics, endpoint=False).tolist()
+    angles += angles[:1]  # Complete the loop
+
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw=dict(polar=True))
+
+    for i, method in enumerate(methods):
+        color = METHOD_COLORS.get(method, '#888888')
+        values = []
+        for metric in metric_names:
+            # Invert and normalize: 1 - (value / max_value)
+            # This way, larger area = better performance
+            if max_vals[metric] > 0:
+                values.append(1 - metrics_dict[method][metric] / max_vals[metric])
+            else:
+                values.append(1.0)
+        values += values[:1]  # Complete the loop
+
+        ax.plot(angles, values, 'o-', linewidth=2, label=method, color=color)
+        ax.fill(angles, values, alpha=0.15, color=color)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metric_names, fontsize=10)
+    ax.set_ylim(0, 1)
+    ax.set_title("Method Comparison (larger area = better)", fontweight='bold', fontsize=12, pad=20)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_point_wise_error_heatmap(gt_xy: np.ndarray, predictions: Dict,
+                                  save_path: str = None, figsize=(16, 4)):
+    """Heatmap showing point-wise errors along the coastline"""
+    methods = list(predictions.keys())
+    n_methods = len(methods)
+    n_points = gt_xy.shape[0]
+
+    # Compute point-wise errors
+    error_matrix = np.zeros((n_methods, n_points))
+    for i, method in enumerate(methods):
+        pred = predictions[method]
+        errors = np.sqrt(np.sum((pred - gt_xy) ** 2, axis=1))
+        error_matrix[i] = errors
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(error_matrix, aspect='auto', cmap='YlOrRd')
+    ax.set_yticks(range(n_methods))
+    ax.set_yticklabels(methods, fontsize=10)
+    ax.set_xlabel("Point Index along Coastline", fontsize=11)
+    ax.set_title("Point-wise Prediction Error Heatmap", fontweight='bold', fontsize=12)
+
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("Euclidean Error", fontsize=10)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_training_curves(train_losses_dict: Dict, val_losses_dict: Dict,
+                         save_path: str = None, figsize=(14, 5)):
+    """Plot training and validation loss curves"""
+    methods = list(train_losses_dict.keys())
+    n_methods = len(methods)
+
+    fig, axes = plt.subplots(1, n_methods, figsize=figsize)
+
+    if n_methods == 1:
+        axes = [axes]
+
+    for ax, method in zip(axes, methods):
+        color = METHOD_COLORS.get(method, '#888888')
+        train_loss = train_losses_dict[method]
+        val_loss = val_losses_dict[method]
+        epochs = range(1, len(train_loss) + 1)
+
+        ax.plot(epochs, train_loss, '-', label='Train', color=color, alpha=0.8)
+        ax.plot(epochs, val_loss, '--', label='Val', color=color, alpha=0.6)
+        ax.set_title(f"{method}", fontweight='bold', fontsize=11)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Training Curves", fontweight='bold', fontsize=13, y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_coastline_evolution(coastlines: List[np.ndarray], timestamps: List[str],
+                             save_path: str = None, figsize=(12, 8)):
+    """Visualize coastline evolution over time with color gradient"""
+    n = len(coastlines)
+    cmap = plt.cm.viridis
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, (coast, ts) in enumerate(zip(coastlines, timestamps)):
+        color = cmap(i / n)
+        alpha = 0.3 + 0.7 * (i / n)  # Newer coastlines more opaque
+        ax.plot(coast[:, 0], coast[:, 1], color=color, alpha=alpha, linewidth=1)
+
+    # Highlight first and last
+    ax.plot(coastlines[0][:, 0], coastlines[0][:, 1], 'b-', linewidth=2.5,
+            label=f'Start: {timestamps[0]}', alpha=0.9)
+    ax.plot(coastlines[-1][:, 0], coastlines[-1][:, 1], 'r-', linewidth=2.5,
+            label=f'End: {timestamps[-1]}', alpha=0.9)
+
+    ax.set_xlabel("Normalized X", fontsize=11)
+    ax.set_ylabel("Normalized Y", fontsize=11)
+    ax.set_title("Coastline Evolution Over Time", fontweight='bold', fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal', adjustable='box')
+
+    # Add colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, n - 1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
+    cbar.set_label("Time Index", fontsize=10)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_metrics_bar_chart(metrics_dict: Dict, save_path: str = None, figsize=(14, 6)):
+    """Bar chart comparing all methods on all metrics"""
+    methods = list(metrics_dict.keys())
+    metric_names = list(metrics_dict[methods[0]].keys())
+    n_metrics = len(metric_names)
+    n_methods = len(methods)
+
+    x = np.arange(n_metrics)
+    width = 0.15
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, method in enumerate(methods):
+        color = METHOD_COLORS.get(method, '#888888')
+        values = [metrics_dict[method][m] for m in metric_names]
+        offset = (i - n_methods / 2 + 0.5) * width
+        bars = ax.bar(x + offset, values, width, label=method, color=color, alpha=0.8)
+
+        # Add value labels on bars
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax.annotate(f'{val:.4f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha='center', va='bottom', fontsize=7, rotation=45)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_names, fontsize=11)
+    ax.set_ylabel("Value (lower is better)", fontsize=11)
+    ax.set_title("Method Comparison Across Metrics", fontweight='bold', fontsize=13)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_summary_dashboard(all_predictions: Dict, all_mses: Dict, avg_metrics: Dict,
+                           test_timestamps: List[str], save_path: str = None):
+    """Create a comprehensive summary dashboard with multiple subplots"""
+    fig = plt.figure(figsize=(20, 16))
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+
+    methods = [m for m in all_mses.keys()]
+
+    # 1) Top-left: Latest prediction comparison
+    ax1 = fig.add_subplot(gs[0, 0])
+    gt = all_predictions['GT'][-1]
+    ax1.plot(gt[:, 0], gt[:, 1], 'k-', linewidth=2.5, label='GT', alpha=0.9)
+    for method in methods:
+        pred = all_predictions[method][-1]
+        color = METHOD_COLORS.get(method, '#888888')
+        ax1.plot(pred[:, 0], pred[:, 1], linewidth=1.5, label=method, alpha=0.8, color=color)
+    ax1.set_title("Latest Prediction Comparison", fontweight='bold', fontsize=11)
+    ax1.legend(fontsize=8, loc='best')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal', adjustable='box')
+
+    # 2) Top-middle: MSE distribution boxplot
+    ax2 = fig.add_subplot(gs[0, 1])
+    mse_data = [all_mses[m] for m in methods]
+    bp = ax2.boxplot(mse_data, labels=methods, patch_artist=True)
+    for patch, method in zip(bp['boxes'], methods):
+        patch.set_facecolor(METHOD_COLORS.get(method, '#888888'))
+        patch.set_alpha(0.7)
+    ax2.set_title("MSE Distribution", fontweight='bold', fontsize=11)
+    ax2.set_ylabel("MSE")
+    ax2.tick_params(axis='x', rotation=45)
+    ax2.grid(True, alpha=0.3)
+
+    # 3) Top-right: Average MSE bar chart
+    ax3 = fig.add_subplot(gs[0, 2])
+    avg_mses = [np.mean(all_mses[m]) for m in methods]
+    colors = [METHOD_COLORS.get(m, '#888888') for m in methods]
+    bars = ax3.bar(methods, avg_mses, color=colors, alpha=0.8)
+    ax3.set_title("Average MSE Comparison", fontweight='bold', fontsize=11)
+    ax3.set_ylabel("Average MSE")
+    ax3.tick_params(axis='x', rotation=45)
+    for bar, val in zip(bars, avg_mses):
+        ax3.annotate(f'{val:.4f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                     xytext=(0, 3), textcoords='offset points', ha='center', fontsize=9)
+    ax3.grid(True, alpha=0.3, axis='y')
+
+    # 4) Middle row: Temporal MSE curves
+    ax4 = fig.add_subplot(gs[1, :])
+    x = np.arange(len(test_timestamps))
+    for method in methods:
+        color = METHOD_COLORS.get(method, '#888888')
+        ax4.plot(x, all_mses[method], marker='o', markersize=3,
+                 label=f"{method} (avg: {np.mean(all_mses[method]):.4f})",
+                 color=color, alpha=0.8)
+    n_show = max(1, len(test_timestamps) // 15)
+    ax4.set_xticks(x[::n_show])
+    ax4.set_xticklabels(test_timestamps[::n_show], rotation=45, ha='right', fontsize=8)
+    ax4.set_title("Prediction Error Over Time", fontweight='bold', fontsize=11)
+    ax4.set_ylabel("MSE")
+    ax4.legend(fontsize=9, loc='upper right')
+    ax4.grid(True, alpha=0.3)
+
+    # 5) Bottom-left: Radar chart
+    ax5 = fig.add_subplot(gs[2, 0], polar=True)
+    metric_names = list(avg_metrics[methods[0]].keys())
+    n_metrics = len(metric_names)
+    max_vals = {m: max(avg_metrics[method][m] for method in methods) for m in metric_names}
+    angles = np.linspace(0, 2 * np.pi, n_metrics, endpoint=False).tolist()
+    angles += angles[:1]
+    for method in methods:
+        color = METHOD_COLORS.get(method, '#888888')
+        values = [1 - avg_metrics[method][m] / max_vals[m] if max_vals[m] > 0 else 1.0 for m in metric_names]
+        values += values[:1]
+        ax5.plot(angles, values, 'o-', linewidth=1.5, label=method, color=color)
+        ax5.fill(angles, values, alpha=0.1, color=color)
+    ax5.set_xticks(angles[:-1])
+    ax5.set_xticklabels(metric_names, fontsize=8)
+    ax5.set_title("Performance Radar\n(larger = better)", fontweight='bold', fontsize=10)
+    ax5.legend(fontsize=7, loc='upper right', bbox_to_anchor=(1.3, 1.0))
+
+    # 6) Bottom-middle: Point-wise error heatmap for latest
+    ax6 = fig.add_subplot(gs[2, 1])
+    gt_last = all_predictions['GT'][-1]
+    error_matrix = np.zeros((len(methods), gt_last.shape[0]))
+    for i, method in enumerate(methods):
+        pred = all_predictions[method][-1]
+        error_matrix[i] = np.sqrt(np.sum((pred - gt_last) ** 2, axis=1))
+    im = ax6.imshow(error_matrix, aspect='auto', cmap='YlOrRd')
+    ax6.set_yticks(range(len(methods)))
+    ax6.set_yticklabels(methods, fontsize=9)
+    ax6.set_xlabel("Point Index", fontsize=10)
+    ax6.set_title("Point-wise Error (Latest)", fontweight='bold', fontsize=10)
+    plt.colorbar(im, ax=ax6, shrink=0.8)
+
+    # 7) Bottom-right: Method ranking table
+    ax7 = fig.add_subplot(gs[2, 2])
+    ax7.axis('off')
+
+    # Create ranking table
+    rankings = []
+    for metric in metric_names:
+        values = [(method, avg_metrics[method][metric]) for method in methods]
+        values.sort(key=lambda x: x[1])
+        rankings.append([v[0] for v in values])
+
+    table_data = [[methods[i]] + [f"{avg_metrics[methods[i]][m]:.4f}" for m in metric_names]
+                  for i in range(len(methods))]
+
+    table = ax7.table(cellText=table_data,
+                      colLabels=['Method'] + metric_names,
+                      loc='center',
+                      cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.5)
+    ax7.set_title("Metrics Summary Table", fontweight='bold', fontsize=11, pad=20)
+
+    plt.suptitle("5-Method Coastline Prediction Comparison Dashboard",
+                 fontweight='bold', fontsize=14, y=0.98)
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    plt.close()
+
+
+# =========================================================
+# 9) MAIN
+# =========================================================
+def main():
+    annotations_dir = "./labelme_images/annotations"
+    if not os.path.exists(annotations_dir):
+        print(f"ERROR: path not found: {annotations_dir}")
+        print('Please set annotations_dir = "C:/.../labelme_images/annotations"')
+        return
+
+    history_length = 5
+    output_dir = "./compare_results_5_methods"
+    os.makedirs(output_dir, exist_ok=True)
+
+    device = get_device(prefer_cuda=True)
+    print(f"[Device] Using: {device}")
+    seed = 0
+    set_seed(seed)
+
+    # Load data
+    loader = LabelMeCoastlineLoader(resample_points=256)
+    data = loader.load_time_series(annotations_dir, normalize=True)
+
+    if not data["success"]:
+        print(f"Error loading data: {data.get('error', 'unknown')}")
+        return
+
+    coastlines = data["coastlines"]
+    timestamps = data["timestamps"]
+    years = data["years"]
+    P = coastlines[0].shape[0]
+    H = P * 2
+
+    print(f"\nLoaded {len(coastlines)} coastlines, {P} points each")
+
+    # Plot coastline evolution
+    plot_coastline_evolution(coastlines, timestamps,
+                             save_path=os.path.join(output_dir, "coastline_evolution.png"))
+
+    dataset = TimeSeriesCoastlineDataset(coastlines, history_length=history_length)
+    M = len(dataset)
+    split = int(0.8 * M)
+
+    train_set = torch.utils.data.Subset(dataset, list(range(0, split)))
+    val_set = torch.utils.data.Subset(dataset, list(range(split, M)))
+    train_loader = DataLoader(train_set, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=8, shuffle=False)
+
+    # Storage for training curves
+    train_losses_all = {}
+    val_losses_all = {}
+
+    # ====================
+    # 1) LSTM
+    # ====================
+    print("\n" + "=" * 60)
+    print("[1/5] Train LSTM baseline")
+    print("=" * 60)
+    lstm_model = TemporalCoastlineLSTM(n_points=P, coord_dim=2, hidden_dim=512, num_layers=2, dropout=0.2)
+    lstm_path = os.path.join(output_dir, "lstm_model.pth")
+    trainer = CoastlineTrainer(lstm_model, device=device, lr=5e-4)
+    train_losses, val_losses = trainer.fit(
+        train_loader, val_loader, epochs=60, early_patience=15, save_path=lstm_path, tag="LSTM"
+    )
+    train_losses_all['LSTM'] = train_losses
+    val_losses_all['LSTM'] = val_losses
+    lstm_model.load_state_dict(torch.load(lstm_path, map_location=device))
+    lstm_pred = CoastlinePredictor(lstm_model, device=device)
+
+    # Prepare diffusion data
+    past_seq_np, past_flat_np, future_np = make_xy_windows(coastlines, history_length=history_length)
+    past_seq = torch.from_numpy(past_seq_np).to(device)
+    past_flat = torch.from_numpy(past_flat_np).to(device)
+    future = torch.from_numpy(future_np).to(device)
+
+    past_seq_train = past_seq[:split]
+    past_seq_test = past_seq[split:]
+    past_flat_train = past_flat[:split]
+    past_flat_test = past_flat[split:]
+    future_train = future[:split]
+    future_test = future[split:]
+
+    past_scaler = ZScoreTorch().fit(past_flat_train)
+    fut_scaler = ZScoreTorch().fit(future_train)
+
+    past_flat_train_s = past_scaler.transform(past_flat_train)
+    past_flat_test_s = past_scaler.transform(past_flat_test)
+    future_train_s = fut_scaler.transform(future_train)
+    future_test_s = fut_scaler.transform(future_test)
+
+    # ====================
+    # 2) Diff-Ridge
+    # ====================
+    print("\n" + "=" * 60)
+    print("[2/5] Train Diffusion-Ridge")
+    print("=" * 60)
+    ridge_T = 20
+    ridge_model = train_diffusion_ridge_streaming(
+        past_flat_train_s, future_train_s,
+        T=ridge_T, n_train_samples=80000, chunk_size=512, ridge=3e-4,
+        device=device, seed=seed
+    )
+
+    # ====================
+    # 3) Diff-Linear
+    # ====================
+    print("\n" + "=" * 60)
+    print("[3/5] Train Diffusion-Linear (SGD)")
+    print("=" * 60)
+    sgd_T = 20
+    diff_lin_model, diff_lin_ab = train_diffusion_sgd_linear(
+        past_flat_train_s, future_train_s,
+        T=sgd_T, steps=3500, batch_size=256, lr=2e-4,
+        device=device, seed=seed
+    )
+
+    # ====================
+    # 4) Mamba+LSTM
+    # ====================
+    print("\n" + "=" * 60)
+    print("[4/5] Train Mamba+LSTM")
+    print("=" * 60)
+    mamba_lstm = MambaLSTMForecaster(
+        H=H, history_len=history_length,
+        d_model=256, mamba_layers=2,
+        lstm_hidden=256, lstm_layers=1,
+        dropout=0.1
+    ).to(device)
+
+    mamba_path = os.path.join(output_dir, "mamba_lstm_model.pth")
+    trainer_mamba = CoastlineTrainer(mamba_lstm, device=device, lr=7e-4)
+    train_losses, val_losses = trainer_mamba.fit(
+        train_loader, val_loader, epochs=80, early_patience=18, save_path=mamba_path, tag="Mamba+LSTM"
+    )
+    train_losses_all['Mamba+LSTM'] = train_losses
+    val_losses_all['Mamba+LSTM'] = val_losses
+    mamba_lstm.load_state_dict(torch.load(mamba_path, map_location=device))
+    mamba_lstm.eval()
+
+    @torch.no_grad()
+    def mamba_predict(history_xy: np.ndarray) -> np.ndarray:
+        x = torch.from_numpy(history_xy.astype(np.float32)).unsqueeze(0).to(device)
+        return mamba_lstm(x)[0].cpu().numpy()
+
+    # ====================
+    # 5) Mamba-Diffusion (NEW)
+    # ====================
+    print("\n" + "=" * 60)
+    print("[5/5] Train Mamba-Diffusion")
+    print("=" * 60)
+    mamba_diff_model = MambaDiffusion(
+        H=H, history_len=history_length,
+        mamba_dim=256, mamba_layers=4,
+        mamba_d_state=16, mamba_d_conv=4,
+        denoiser_hidden=512, denoiser_blocks=6,
+        time_dim=256, n_heads=4,
+        T=100, dropout=0.1,
+        cfg_dropout=0.1
+    ).to(device)
+
+    mamba_diff_path = os.path.join(output_dir, "mamba_diffusion_model.pth")
+
+    # Scale the sequential data
+    past_seq_scaler = ZScoreTorch().fit(past_seq_train.view(split, -1))
+    past_seq_train_s = past_seq_scaler.transform(past_seq_train.view(split, -1)).view(split, history_length, H)
+    past_seq_test_s = past_seq_scaler.transform(past_seq_test.view(M - split, -1)).view(M - split, history_length, H)
+
+    mamba_diff_trainer = MambaDiffusionTrainer(mamba_diff_model, device=device, lr=2e-4)
+    mamba_diff_trainer.fit(
+        past_seq_train_s, future_train_s,
+        past_seq_test_s, future_test_s,
+        epochs=150, batch_size=32, early_patience=25,
+        save_path=mamba_diff_path
+    )
+
+    # Load EMA weights
+    ema_weights = torch.load(mamba_diff_path, map_location=device)
+    mamba_diff_model.load_state_dict(ema_weights)
+    mamba_diff_model.eval()
+
+    @torch.no_grad()
+    def mamba_diff_predict(history_xy: np.ndarray, use_ddim: bool = True, cfg_scale: float = 2.0) -> np.ndarray:
+        x = torch.from_numpy(history_xy.astype(np.float32)).to(device)
+        x_flat = x.reshape(1, history_length, H)
+        x_s = past_seq_scaler.transform(x_flat.view(1, -1)).view(1, history_length, H)
+
+        if use_ddim:
+            pred_s = mamba_diff_model.sample_ddim(x_s, n_samples=4, cfg_scale=cfg_scale, steps=20, seed=seed)
+        else:
+            pred_s = mamba_diff_model.sample(x_s, n_samples=4, cfg_scale=cfg_scale, seed=seed)
+
+        pred = fut_scaler.inverse(pred_s)
+        return pred[0].cpu().numpy().reshape(P, 2)
+
+    # ====================
+    # Evaluation
+    # ====================
+    print("\n" + "=" * 60)
+    print("Evaluation (test split)")
+    print("=" * 60)
+
+    # Collect all predictions and errors
+    all_predictions = {'GT': [], 'LSTM': [], 'Diff-Ridge': [], 'Diff-Linear': [],
+                       'Mamba+LSTM': [], 'Mamba-Diffusion': []}
+    all_mses = {'LSTM': [], 'Diff-Ridge': [], 'Diff-Linear': [],
+                'Mamba+LSTM': [], 'Mamba-Diffusion': []}
+
+    test_timestamps = timestamps[history_length + split:]
+
+    for w in range(split, M):
+        hist_xy = np.stack(coastlines[w:w + history_length], axis=0)
+        gt_xy = coastlines[w + history_length]
+
+        all_predictions['GT'].append(gt_xy)
+
+        # LSTM
+        lstm_xy = lstm_pred.predict_next(hist_xy)
+        all_predictions['LSTM'].append(lstm_xy)
+        all_mses['LSTM'].append(CoastlineMetrics.mse(lstm_xy, gt_xy))
+
+        # Mamba+LSTM
+        mamba_xy = mamba_predict(hist_xy)
+        all_predictions['Mamba+LSTM'].append(mamba_xy)
+        all_mses['Mamba+LSTM'].append(CoastlineMetrics.mse(mamba_xy, gt_xy))
+
+        # Mamba-Diffusion
+        mamba_diff_xy = mamba_diff_predict(hist_xy)
+        all_predictions['Mamba-Diffusion'].append(mamba_diff_xy)
+        all_mses['Mamba-Diffusion'].append(CoastlineMetrics.mse(mamba_diff_xy, gt_xy))
+
+    # Diffusion models (batch evaluation)
+    def eval_diff_ridge(chunk=64):
+        preds = []
+        mses = []
+        Btot = past_flat_test_s.shape[0]
+        for i in range(0, Btot, chunk):
+            pb = past_flat_test_s[i:i + chunk]
+            gt = future_test[i:i + chunk]
+            mean_s = diffusion_ridge_sample_batch(ridge_model, pb, n_samples=4, seed=seed + 2000 + i)
+            mean = fut_scaler.inverse(mean_s)
+            for j in range(mean.shape[0]):
+                pred_xy = mean[j].cpu().numpy().reshape(P, 2)
+                gt_xy = gt[j].cpu().numpy().reshape(P, 2)
+                preds.append(pred_xy)
+                mses.append(CoastlineMetrics.mse(pred_xy, gt_xy))
+        return preds, mses
+
+    def eval_diff_linear(chunk=64):
+        preds = []
+        mses = []
+        Btot = past_flat_test_s.shape[0]
+        for i in range(0, Btot, chunk):
+            pb = past_flat_test_s[i:i + chunk]
+            gt = future_test[i:i + chunk]
+            mean_s = diffusion_sample_batch_linear(diff_lin_model, pb, sgd_T, diff_lin_ab, n_samples=8,
+                                                   seed=seed + 1000 + i)
+            mean = fut_scaler.inverse(mean_s)
+            for j in range(mean.shape[0]):
+                pred_xy = mean[j].cpu().numpy().reshape(P, 2)
+                gt_xy = gt[j].cpu().numpy().reshape(P, 2)
+                preds.append(pred_xy)
+                mses.append(CoastlineMetrics.mse(pred_xy, gt_xy))
+        return preds, mses
+
+    ridge_preds, ridge_mses = eval_diff_ridge()
+    lin_preds, lin_mses = eval_diff_linear()
+
+    all_predictions['Diff-Ridge'] = ridge_preds
+    all_predictions['Diff-Linear'] = lin_preds
+    all_mses['Diff-Ridge'] = ridge_mses
+    all_mses['Diff-Linear'] = lin_mses
+
+    # Print average MSE
+    print("\nAverage Test MSE:")
+    for method, mses in all_mses.items():
+        print(f"  {method:20s}: {np.mean(mses):.6f} (std: {np.std(mses):.6f})")
+
+    # ====================
+    # Visualizations
+    # ====================
+    print("\n" + "=" * 60)
+    print("Generating Visualizations")
+    print("=" * 60)
+
+    # 1) Training curves (for models that have them)
+    if train_losses_all:
+        plot_training_curves(train_losses_all, val_losses_all,
+                             save_path=os.path.join(output_dir, "training_curves.png"))
+
+    # 2) Error distribution
+    plot_error_distribution(all_mses,
+                            save_path=os.path.join(output_dir, "error_distribution.png"))
+
+    # 3) Temporal MSE curve
+    plot_temporal_mse_curve(all_mses, test_timestamps,
+                            save_path=os.path.join(output_dir, "temporal_mse_curve.png"))
+
+    # 4) Multi-year comparison (select 3 time points)
+    n_test = len(all_predictions['GT'])
+    if n_test >= 3:
+        indices = [0, n_test // 2, n_test - 1]  # start, middle, end
+        plot_multi_year_comparison(all_predictions, test_timestamps, indices,
+                                   save_path=os.path.join(output_dir, "multi_year_comparison.png"))
+
+    # 5) Single case comparison (latest)
+    w_vis = -1
+    gt_vis = all_predictions['GT'][w_vis]
+    lstm_vis = all_predictions['LSTM'][w_vis]
+    ridge_vis = all_predictions['Diff-Ridge'][w_vis]
+    lin_vis = all_predictions['Diff-Linear'][w_vis]
+    mamba_vis = all_predictions['Mamba+LSTM'][w_vis]
+    mamba_diff_vis = all_predictions['Mamba-Diffusion'][w_vis]
+
+    plot_prediction_compare_5(
+        gt_vis, lstm_vis, ridge_vis, lin_vis, mamba_vis, mamba_diff_vis,
+        save_path=os.path.join(output_dir, "prediction_compare_5_methods.png"),
+        title=f"5-Method Comparison (Test sample: {test_timestamps[w_vis]})"
+    )
+
+    # 6) Metrics radar chart
+    avg_metrics = {}
+    for method in all_mses.keys():
+        # Compute average metrics over all test samples
+        all_metrics = []
+        for i in range(len(all_predictions[method])):
+            all_metrics.append(CoastlineMetrics.evaluate_all(
+                all_predictions[method][i], all_predictions['GT'][i]
+            ))
+        avg_metrics[method] = {
+            k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0].keys()
+        }
+
+    plot_metrics_radar(avg_metrics,
+                       save_path=os.path.join(output_dir, "metrics_radar.png"))
+
+    # 7) Metrics bar chart
+    plot_metrics_bar_chart(avg_metrics,
+                           save_path=os.path.join(output_dir, "metrics_bar_chart.png"))
+
+    # 8) Point-wise error heatmap for latest prediction
+    predictions_latest = {
+        'LSTM': lstm_vis,
+        'Diff-Ridge': ridge_vis,
+        'Diff-Linear': lin_vis,
+        'Mamba+LSTM': mamba_vis,
+        'Mamba-Diffusion': mamba_diff_vis
+    }
+    plot_point_wise_error_heatmap(gt_vis, predictions_latest,
+                                  save_path=os.path.join(output_dir, "pointwise_error_heatmap.png"))
+
+    # 9) Comprehensive summary dashboard
+    plot_summary_dashboard(all_predictions, all_mses, avg_metrics, test_timestamps,
+                           save_path=os.path.join(output_dir, "summary_dashboard.png"))
+
+    # ====================
+    # Save metrics report
+    # ====================
+    report_path = os.path.join(output_dir, "metrics_report_5_methods.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("=" * 70 + "\n")
+        f.write("5-Method Coastline Prediction Comparison\n")
+        f.write("=" * 70 + "\n\n")
+
+        f.write("Methods:\n")
+        f.write("  1. LSTM (baseline)\n")
+        f.write("  2. Diffusion-Ridge\n")
+        f.write("  3. Diffusion-Linear (SGD)\n")
+        f.write("  4. Mamba+LSTM\n")
+        f.write("  5. Mamba-Diffusion (NEW)\n\n")
+
+        f.write("Average Test MSE (lower is better):\n")
+        f.write("-" * 50 + "\n")
+        for method, mses in sorted(all_mses.items(), key=lambda x: np.mean(x[1])):
+            f.write(f"  {method:20s}: {np.mean(mses):.10f} (std: {np.std(mses):.6f})\n")
+
+        f.write("\n" + "=" * 70 + "\n")
+        f.write("Average Metrics Across All Test Samples:\n")
+        f.write("-" * 50 + "\n")
+
+        for method in avg_metrics:
+            f.write(f"\n{method}:\n")
+            for metric, value in avg_metrics[method].items():
+                f.write(f"  {metric:15s}: {value:.10f}\n")
+
+        f.write("\n" + "=" * 70 + "\n")
+        f.write("Single-case Metrics (Latest Test Sample):\n")
+        f.write("-" * 50 + "\n")
+
+        for name, pred in predictions_latest.items():
+            metrics = CoastlineMetrics.evaluate_all(pred, gt_vis)
+            f.write(f"\n{name}:\n")
+            for k, v in metrics.items():
+                f.write(f"  {k:15s}: {v:.10f}\n")
+
+    print(f"\nSaved metrics report: {report_path}")
+    print(f"All visualizations saved to: {output_dir}")
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()
