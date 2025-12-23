@@ -1,0 +1,96 @@
+======================================================================
+5-Method Coastline Prediction Comparison
+======================================================================
+
+Methods:
+  1. LSTM (baseline)
+  2. Diffusion-Ridge
+  3. Diffusion-Linear (SGD)
+  4. Mamba+LSTM
+  5. Mamba-Diffusion (NEW)
+
+Average Test MSE (lower is better):
+--------------------------------------------------
+  Mamba+LSTM          : 0.0016179683 (std: 0.004787)
+  LSTM                : 0.0016384436 (std: 0.004792)
+  Diff-Ridge          : 0.0016649892 (std: 0.004721)
+  Diff-Linear         : 0.0017233121 (std: 0.004818)
+  Mamba-Diffusion     : 0.0023321378 (std: 0.004824)
+
+======================================================================
+Average Metrics Across All Test Samples:
+--------------------------------------------------
+
+LSTM:
+  MSE            : 0.0016384436
+  RMSE           : 0.0235426318
+  MAE            : 0.0158631041
+  Hausdorff      : 0.0372732308
+  MaxError       : 0.0894370147
+
+Diff-Ridge:
+  MSE            : 0.0016649892
+  RMSE           : 0.0249446008
+  MAE            : 0.0159995275
+  Hausdorff      : 0.0501854822
+  MaxError       : 0.0977169815
+
+Diff-Linear:
+  MSE            : 0.0017233121
+  RMSE           : 0.0259879313
+  MAE            : 0.0166194864
+  Hausdorff      : 0.0492255218
+  MaxError       : 0.1138272230
+
+Mamba+LSTM:
+  MSE            : 0.0016179683
+  RMSE           : 0.0228462458
+  MAE            : 0.0154026081
+  Hausdorff      : 0.0357411079
+  MaxError       : 0.0873640451
+
+Mamba-Diffusion:
+  MSE            : 0.0023321378
+  RMSE           : 0.0384119680
+  MAE            : 0.0236808766
+  Hausdorff      : 0.0820850541
+  MaxError       : 0.2062150463
+
+======================================================================
+Single-case Metrics (Latest Test Sample):
+--------------------------------------------------
+
+LSTM:
+  MSE            : 0.0001865959
+  RMSE           : 0.0136600128
+  MAE            : 0.0099162636
+  Hausdorff      : 0.0243829270
+  MaxError       : 0.0482932851
+
+Diff-Ridge:
+  MSE            : 0.0002283116
+  RMSE           : 0.0151099846
+  MAE            : 0.0095311487
+  Hausdorff      : 0.0586930523
+  MaxError       : 0.0602980666
+
+Diff-Linear:
+  MSE            : 0.0003034766
+  RMSE           : 0.0174205810
+  MAE            : 0.0113029685
+  Hausdorff      : 0.0382187705
+  MaxError       : 0.0838348642
+
+Mamba+LSTM:
+  MSE            : 0.0001730717
+  RMSE           : 0.0131556703
+  MAE            : 0.0098819053
+  Hausdorff      : 0.0282649545
+  MaxError       : 0.0473452471
+
+Mamba-Diffusion:
+  MSE            : 0.0008264941
+  RMSE           : 0.0287488109
+  MAE            : 0.0176699013
+  Hausdorff      : 0.0764461135
+  MaxError       : 0.2100556493
